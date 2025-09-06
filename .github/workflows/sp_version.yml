@@ -1,4 +1,4 @@
-name: Auto Update Worker
+name: Update sp Worker
 
 on:
   workflow_dispatch:
