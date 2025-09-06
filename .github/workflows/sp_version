@@ -1,0 +1,117 @@
+name: Auto Update Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: '要构建的特定版本 (例如: 3.3.16)'
+        required: true # 手动执行时必须填写版本号
+        default: '3.3.16'
+      force_update:
+        description: '是否强制更新（忽略版本检查）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+env:
+  TARGET_REPO: bia-pain-bache/BPB-Worker-Panel
+  TARGET_ZIP_FILE: worker.zip # 下载的zip文件名
+  MAIN_WORKER_FILE: worker.js # zip解压后的主要文件名
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检查并更新 Worker
+        id: update_worker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 日志函数
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+
+          # <-- 核心改动：根据触发事件来决定行为
+          # github.event_name 的值会是 'push', 'schedule', 或 'workflow_dispatch'
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # --- 手动执行逻辑 ---
+            MODE="手动"
+            TARGET_VERSION=${{ github.event.inputs.target_version }}
+            log "手动模式启动，目标版本: $TARGET_VERSION"
+            # 手动模式下直接请求指定 tag 的 API
+            API_URL="https://api.github.com/repos/${TARGET_REPO}/releases/tags/${TARGET_VERSION}"
+          else
+            # --- 自动执行逻辑 ---
+            MODE="自动"
+            log "自动模式启动，检查最新版本..."
+            # 自动模式下请求最新的 release API
+            API_URL="https://api.github.com/repos/${TARGET_REPO}/releases/latest"
+            
+            # 自动模式下检查本地版本，如果一致则无需更新
+            LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+            LATEST_TAG_NAME=$(curl -s -H "Authorization: token $GITHUB_TOKEN" $API_URL | jq -r '.tag_name')
+            log "本地版本: ${LOCAL_VERSION:-无}, 最新版本: ${LATEST_TAG_NAME:-未知}"
+            if [ "$LOCAL_VERSION" = "$LATEST_TAG_NAME" ] && [ "${{ github.event.inputs.force_update }}" != "true" ]; then
+              log "已是最新版本，无需更新。"
+              exit 0
+            fi
+          fi
+
+          log "从 $API_URL 获取 Release 信息..."
+          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$API_URL")
+          
+          if [ $? -ne 0 ] || [[ "$RESPONSE" == *"Not Found"* ]]; then
+            log "ERROR: 无法访问 GitHub API 或找不到指定版本。"
+            exit 1
+          fi
+
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.assets[] | select(.name == "'"$TARGET_ZIP_FILE"'") | .browser_download_url')
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            log "ERROR: 在版本 $TAG_NAME 中未找到 $TARGET_ZIP_FILE"
+            exit 1
+          fi
+          log "成功获取版本 $TAG_NAME 的下载链接"
+          
+          # 下载
+          log "下载 $TARGET_ZIP_FILE..."
+          wget -q -O "$TARGET_ZIP_FILE" "$DOWNLOAD_URL"
+          
+          log "解压 $TARGET_ZIP_FILE..."
+          unzip -o "$TARGET_ZIP_FILE" # 使用 -o 覆盖解压
+
+          if [ "$MODE" == "手动" ]; then
+            # --- 手动模式下的文件处理和提交信息 ---
+            OUTPUT_FILE="${MAIN_WORKER_FILE%.*}-${TAG_NAME}.js"
+            log "手动模式：将 $MAIN_WORKER_FILE 重命名为 $OUTPUT_FILE"
+            mv "$MAIN_WORKER_FILE" "$OUTPUT_FILE"
+            # 清理下载的zip文件
+            rm "$TARGET_ZIP_FILE"
+            # 设置提交信息
+            COMMIT_MSG="📦 手动构建指定版本 Worker: $TAG_NAME"
+          else
+            # --- 自动模式下的文件处理和提交信息 ---
+            log "自动模式：更新 version.txt 文件"
+            echo "$TAG_NAME" > version.txt
+            # 清理下载的zip文件
+            rm "$TARGET_ZIP_FILE"
+            # 设置提交信息
+            COMMIT_MSG="🔄 自动同步 Worker 到最新版本: $TAG_NAME"
+          fi
+          
+          # 将提交信息设置为步骤输出，供下一步使用
+          echo "commit_message=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+
+      - name: 提交更改
+        if: steps.update_worker.conclusion == 'success' && steps.update_worker.outputs.commit_message != ''
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: ${{ steps.update_worker.outputs.commit_message }}
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
