@@ -6,7 +6,7 @@ on:
       target_version:
         description: '要构建的特定版本 (例如: 3.3.16)'
         required: true # 手动执行时必须填写版本号
-        default: '3.3.16'
+        default: 'v3.3.16'
       force_update:
         description: '是否强制更新（忽略版本检查）'
         required: false
@@ -17,8 +17,9 @@ permissions:
 
 env:
   TARGET_REPO: bia-pain-bache/BPB-Worker-Panel
-  TARGET_ZIP_FILE: worker.zip # 下载的zip文件名
-  MAIN_WORKER_FILE: worker.js # zip解压后的主要文件名
+  # <-- 变动 1: 目标文件从 worker.zip 变为 _worker.js 
+  # 注意：根据您的日志，目标仓库release中的文件名是 _worker.js
+  TARGET_JS_FILE: worker.js 
 
 jobs:
   update:
@@ -35,31 +36,11 @@ jobs:
           # 日志函数
           log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
 
-          # <-- 核心改动：根据触发事件来决定行为
-          # github.event_name 的值会是 'push', 'schedule', 或 'workflow_dispatch'
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # --- 手动执行逻辑 ---
-            MODE="手动"
-            TARGET_VERSION=${{ github.event.inputs.target_version }}
-            log "手动模式启动，目标版本: $TARGET_VERSION"
-            # 手动模式下直接请求指定 tag 的 API
-            API_URL="https://api.github.com/repos/${TARGET_REPO}/releases/tags/${TARGET_VERSION}"
-          else
-            # --- 自动执行逻辑 ---
-            MODE="自动"
-            log "自动模式启动，检查最新版本..."
-            # 自动模式下请求最新的 release API
-            API_URL="https://api.github.com/repos/${TARGET_REPO}/releases/latest"
-            
-            # 自动模式下检查本地版本，如果一致则无需更新
-            LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
-            LATEST_TAG_NAME=$(curl -s -H "Authorization: token $GITHUB_TOKEN" $API_URL | jq -r '.tag_name')
-            log "本地版本: ${LOCAL_VERSION:-无}, 最新版本: ${LATEST_TAG_NAME:-未知}"
-            if [ "$LOCAL_VERSION" = "$LATEST_TAG_NAME" ] && [ "${{ github.event.inputs.force_update }}" != "true" ]; then
-              log "已是最新版本，无需更新。"
-              exit 0
-            fi
-          fi
+          # --- 手动执行逻辑 ---
+          MODE="手动"
+          TARGET_VERSION=${{ github.event.inputs.target_version }}
+          log "手动模式启动，目标版本: $TARGET_VERSION"
+          API_URL="https://api.github.com/repos/${TARGET_REPO}/releases/tags/${TARGET_VERSION}"
 
           log "从 $API_URL 获取 Release 信息..."
           RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$API_URL")
@@ -70,47 +51,31 @@ jobs:
           fi
 
           TAG_NAME=$(echo "$RESPONSE" | jq -r '.tag_name')
-          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.assets[] | select(.name == "'"$TARGET_ZIP_FILE"'") | .browser_download_url')
+          # <-- 变动 2: jq查询的目标从 $TARGET_ZIP_FILE 变为 $TARGET_JS_FILE
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.assets[] | select(.name == "'"$TARGET_JS_FILE"'") | .browser_download_url')
 
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            log "ERROR: 在版本 $TAG_NAME 中未找到 $TARGET_ZIP_FILE"
+            log "ERROR: 在版本 $TAG_NAME 中未找到 $TARGET_JS_FILE"
             exit 1
           fi
           log "成功获取版本 $TAG_NAME 的下载链接"
           
-          # 下载
-          log "下载 $TARGET_ZIP_FILE..."
-          wget -q -O "$TARGET_ZIP_FILE" "$DOWNLOAD_URL"
+          # --- 文件处理逻辑（已简化） ---
+          # <-- 变动 3: 直接下载JS文件，并命名为带版本号的新文件名
+          OUTPUT_FILE="${TARGET_JS_FILE%.*}-${TAG_NAME}.js" # 生成如 _worker-v3.3.16.js 的文件名
+          log "下载 $TARGET_JS_FILE 并保存为 $OUTPUT_FILE..."
+          wget -q -O "$OUTPUT_FILE" "$DOWNLOAD_URL"
           
-          log "解压 $TARGET_ZIP_FILE..."
-          unzip -o "$TARGET_ZIP_FILE" # 使用 -o 覆盖解压
-
-          if [ "$MODE" == "手动" ]; then
-            # --- 手动模式下的文件处理和提交信息 ---
-            OUTPUT_FILE="${MAIN_WORKER_FILE%.*}-${TAG_NAME}.js"
-            log "手动模式：将 $MAIN_WORKER_FILE 重命名为 $OUTPUT_FILE"
-            mv "$MAIN_WORKER_FILE" "$OUTPUT_FILE"
-            # 清理下载的zip文件
-            rm "$TARGET_ZIP_FILE"
-            # 设置提交信息
-            COMMIT_MSG="📦 手动构建指定版本 Worker: $TAG_NAME"
-          else
-            # --- 自动模式下的文件处理和提交信息 ---
-            log "自动模式：更新 version.txt 文件"
-            echo "$TAG_NAME" > version.txt
-            # 清理下载的zip文件
-            rm "$TARGET_ZIP_FILE"
-            # 设置提交信息
-            COMMIT_MSG="🔄 自动同步 Worker 到最新版本: $TAG_NAME"
-          fi
+          # <-- 变动 4: 不再需要解压和重命名步骤
           
-          # 将提交信息设置为步骤输出，供下一步使用
+          COMMIT_MSG="📦 手动构建指定版本 Worker: $TAG_NAME"
+          
+          # 将提交信息设置为步骤输出
           echo "commit_message=$COMMIT_MSG" >> $GITHUB_OUTPUT
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
-
       - name: 提交更改
-        if: steps.update_worker.conclusion == 'success' && steps.update_worker.outputs.commit_message != ''
+        if: steps.update_worker.conclusion == 'success'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: ${{ steps.update_worker.outputs.commit_message }}
